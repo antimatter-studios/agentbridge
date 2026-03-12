@@ -96,8 +96,8 @@ func main() {
 	log.Println("agent-bridge: shutting down")
 }
 
-// handleConn reads newline-delimited prompts from a TCP connection
-// and streams agent responses back.
+// handleConn reads newline-delimited messages from a TCP connection.
+// Lines starting with "/" are control commands; everything else is a prompt.
 func handleConn(conn net.Conn, bridge *Bridge) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
@@ -107,14 +107,20 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB max message
 
 	for scanner.Scan() {
-		prompt := strings.TrimSpace(scanner.Text())
-		if prompt == "" {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
 			continue
 		}
 
-		log.Printf("[%s] prompt: %s", remote, truncate(prompt, 80))
+		// Control commands.
+		if strings.HasPrefix(line, "/") {
+			handleCommand(conn, bridge, remote, line)
+			continue
+		}
 
-		if err := bridge.Send(prompt, conn); err != nil {
+		log.Printf("[%s] prompt: %s", remote, truncate(line, 80))
+
+		if err := bridge.Send(line, conn); err != nil {
 			log.Printf("[%s] agent error: %v", remote, err)
 			fmt.Fprintf(conn, "ERROR: %v\n", err)
 		}
@@ -127,6 +133,43 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 		log.Printf("[%s] read error: %v", remote, err)
 	}
 	log.Printf("[%s] disconnected", remote)
+}
+
+// handleCommand processes slash commands sent over the TCP connection.
+func handleCommand(conn net.Conn, bridge *Bridge, remote, line string) {
+	parts := strings.Fields(line)
+	cmd := parts[0]
+
+	switch cmd {
+	case "/reset":
+		newID := bridge.ResetSession("")
+		log.Printf("[%s] session reset → %s", remote, newID)
+		fmt.Fprintf(conn, "OK session=%s\n", newID)
+
+	case "/session":
+		if len(parts) < 2 {
+			fmt.Fprintf(conn, "OK session=%s\n", bridge.SessionID())
+			return
+		}
+		newID := bridge.ResetSession(parts[1])
+		log.Printf("[%s] session set → %s", remote, newID)
+		fmt.Fprintf(conn, "OK session=%s\n", newID)
+
+	case "/status":
+		fmt.Fprintf(conn, "OK session=%s prompted=%v\n", bridge.SessionID(), bridge.HasPrompted())
+
+	case "/help":
+		fmt.Fprintln(conn, "/reset          — start a new session (generates fresh ID)")
+		fmt.Fprintln(conn, "/session        — show current session ID")
+		fmt.Fprintln(conn, "/session <id>   — switch to a specific session ID")
+		fmt.Fprintln(conn, "/status         — show bridge status")
+		fmt.Fprintln(conn, "/help           — show this help")
+
+	default:
+		fmt.Fprintf(conn, "ERROR: unknown command %q (try /help)\n", cmd)
+	}
+
+	fmt.Fprintln(conn, "---END---")
 }
 
 func truncate(s string, n int) string {

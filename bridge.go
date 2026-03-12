@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Bridge manages a persistent CLI agent process and pipes messages to/from it.
@@ -156,6 +157,33 @@ func (b *Bridge) sendStdin(prompt string, out io.Writer) error {
 	}
 
 	return scanner.Err()
+}
+
+// SessionID returns the current session ID.
+func (b *Bridge) SessionID() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sessionID
+}
+
+// HasPrompted returns whether at least one prompt has been sent.
+func (b *Bridge) HasPrompted() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.prompted
+}
+
+// ResetSession switches to a new session ID. If id is empty, generates one.
+// Returns the new session ID.
+func (b *Bridge) ResetSession(id string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if id == "" {
+		id = fmt.Sprintf("ab-%d-%d", os.Getpid(), time.Now().Unix())
+	}
+	b.sessionID = id
+	b.prompted = false
+	return id
 }
 
 // Stop terminates the agent process if running.
