@@ -5,6 +5,10 @@
 // delimited messages, forwards them to the configured CLI agent, and
 // streams responses back over the connection.
 //
+// Input and output are fully async — inbound prompts are queued
+// immediately (with QUEUED acknowledgement) while the agent processes
+// them one at a time. Responses stream back without blocking input.
+//
 // Usage:
 //
 //	agent-bridge --listen :9999 --config agent.yaml
@@ -26,6 +30,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -96,12 +101,41 @@ func main() {
 	log.Println("agent-bridge: shutting down")
 }
 
-// handleConn reads newline-delimited messages from a TCP connection.
-// Lines starting with "/" are control commands; everything else is a prompt.
+// connWriter is a thread-safe writer for a TCP connection.
+// Multiple goroutines (input reader, output streamer) write to the same
+// connection — this serialises their writes.
+type connWriter struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (cw *connWriter) Write(p []byte) (int, error) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	return cw.conn.Write(p)
+}
+
+func (cw *connWriter) WriteString(s string) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	fmt.Fprint(cw.conn, s)
+}
+
+func (cw *connWriter) WriteLine(s string) {
+	cw.mu.Lock()
+	defer cw.mu.Unlock()
+	fmt.Fprintln(cw.conn, s)
+}
+
+// handleConn manages a TCP connection with async input/output.
+// Input goroutine: reads lines, queues them immediately, sends QUEUED ack.
+// Output: responses stream back via the connWriter as the worker processes jobs.
 func handleConn(conn net.Conn, bridge *Bridge) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 	log.Printf("connection from %s", remote)
+
+	cw := &connWriter{conn: conn}
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB max message
@@ -112,38 +146,43 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 			continue
 		}
 
-		// Control commands.
+		// Control commands — queued like prompts for sequential processing.
 		if strings.HasPrefix(line, "/") {
-			handleCommand(conn, bridge, remote, line)
+			parts := strings.Fields(line)
+			log.Printf("[%s] command: %s", remote, line)
+
+			pos := bridge.QueueDepth()
+			cw.WriteLine(fmt.Sprintf("QUEUED pos=%d", pos))
+
+			go func(cmd string, args []string) {
+				if err := bridge.HandleCommand(cmd, args, cw); err != nil {
+					log.Printf("[%s] command error: %v", remote, err)
+					cw.WriteLine(fmt.Sprintf("ERROR: %v", err))
+				}
+				cw.WriteLine("---END---")
+			}(parts[0], parts[1:])
 			continue
 		}
 
 		log.Printf("[%s] prompt: %s", remote, truncate(line, 80))
 
-		if err := bridge.Send(line, conn); err != nil {
-			log.Printf("[%s] agent error: %v", remote, err)
-			fmt.Fprintf(conn, "ERROR: %v\n", err)
-		}
+		// Acknowledge immediately — don't block on agent response.
+		pos := bridge.QueueDepth()
+		cw.WriteLine(fmt.Sprintf("QUEUED pos=%d", pos))
 
-		// Write a delimiter so the client knows the response is complete.
-		fmt.Fprintln(conn, "---END---")
+		go func(prompt string) {
+			if err := bridge.Send(prompt, cw); err != nil {
+				log.Printf("[%s] agent error: %v", remote, err)
+				cw.WriteLine(fmt.Sprintf("ERROR: %v", err))
+			}
+			cw.WriteLine("---END---")
+		}(line)
 	}
 
 	if err := scanner.Err(); err != nil {
 		log.Printf("[%s] read error: %v", remote, err)
 	}
 	log.Printf("[%s] disconnected", remote)
-}
-
-// handleCommand delegates slash commands to the bridge, which knows
-// what agent it's talking to and how to handle each command.
-func handleCommand(conn net.Conn, bridge *Bridge, remote, line string) {
-	parts := strings.Fields(line)
-	log.Printf("[%s] command: %s", remote, line)
-
-	result := bridge.HandleCommand(parts[0], parts[1:])
-	fmt.Fprint(conn, result)
-	fmt.Fprintln(conn, "---END---")
 }
 
 func truncate(s string, n int) string {
