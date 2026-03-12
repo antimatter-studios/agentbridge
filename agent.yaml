@@ -1,5 +1,6 @@
 # agent-bridge configuration
 # Defines how to spawn and communicate with a CLI agent.
+# All agents use session-based conversation continuity.
 
 # The agent to use (matches a key under "agents" below).
 active: claude
@@ -13,16 +14,10 @@ agents:
       - "stream-json"
       - "--model"
       - "claude-sonnet-4-6"
-    # How to send a prompt: "stdin" writes to stdin, "flag" appends as CLI arg.
-    input_mode: flag
-    # For flag mode, the flag that precedes the prompt text.
     input_flag: "-p"
-    # Session continuity — maintains conversation context across prompts.
     session_flag: "--session-id"
     resume_flag: "--resume"
-    # Working directory for the agent process (default: current dir).
     workdir: /workspace
-    # Environment variables to set for the agent process.
     env:
       CI: "1"
 
@@ -30,13 +25,13 @@ agents:
     command: codex
     args:
       - "--quiet"
-    input_mode: stdin
+    input_flag: ""
     workdir: /workspace
     env: {}
 
   opencode:
     command: opencode
     args: []
-    input_mode: stdin
+    input_flag: ""
     workdir: /workspace
     env: {}

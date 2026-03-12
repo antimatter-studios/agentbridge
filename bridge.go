@@ -2,55 +2,60 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 )
 
-// job represents a queued prompt or command to be processed sequentially.
-type job struct {
-	prompt  string   // empty for commands
-	command string   // e.g. "/reset", empty for prompts
-	args    []string // command arguments
-	out     io.Writer
-	done    chan error // signals completion; nil error = success
-}
-
-// Bridge manages a CLI agent process and serialises all prompts through a queue.
+// Bridge manages a CLI agent process with a persistent SQLite-backed job queue.
+// All prompts use session IDs for conversation continuity — no one-shot mode.
 type Bridge struct {
 	cfg       AgentConfig
 	sessionID string
+	store     *Store
 
 	mu       sync.Mutex
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   io.ReadCloser
 	prompted bool // true after the first prompt (for resume logic)
 
-	queue chan job
+	queue chan struct{} // signals that new work is available
 }
 
-// NewBridge creates a bridge for the given agent config and session ID.
-func NewBridge(cfg AgentConfig, sessionID string) *Bridge {
+// NewBridge creates a bridge with a persistent store.
+func NewBridge(cfg AgentConfig, sessionID string, store *Store) *Bridge {
 	return &Bridge{
 		cfg:       cfg,
 		sessionID: sessionID,
-		queue:     make(chan job, 64), // buffered queue for up to 64 pending jobs
+		store:     store,
+		queue:     make(chan struct{}, 64),
 	}
 }
 
-// Start spawns the agent process (if needed) and starts the queue worker.
+// Start recovers any interrupted jobs and starts the queue worker.
 func (b *Bridge) Start() error {
-	if b.cfg.InputMode == "flag" {
-		log.Printf("bridge: agent %q configured in flag mode — will spawn per request", b.cfg.Command)
-	} else {
-		if err := b.spawnPersistent(); err != nil {
-			return err
+	// Recover jobs that were processing when we crashed.
+	recovered, err := b.store.RecoverProcessing()
+	if err != nil {
+		return fmt.Errorf("recover jobs: %w", err)
+	}
+	if recovered > 0 {
+		log.Printf("bridge: recovered %d interrupted jobs", recovered)
+	}
+
+	// Check if there are pending jobs from a previous run.
+	pending, err := b.store.PendingCount()
+	if err != nil {
+		return fmt.Errorf("count pending: %w", err)
+	}
+	if pending > 0 {
+		log.Printf("bridge: %d pending jobs from previous run", pending)
+		// Signal the worker for each pending job.
+		for range pending {
+			b.queue <- struct{}{}
 		}
 	}
 
@@ -58,95 +63,86 @@ func (b *Bridge) Start() error {
 	return nil
 }
 
-// worker processes jobs sequentially from the queue.
+// Enqueue adds a prompt to the persistent queue and returns its job ID.
+func (b *Bridge) Enqueue(prompt string) (int64, error) {
+	id, err := b.store.Enqueue("prompt", prompt, "")
+	if err != nil {
+		return 0, err
+	}
+	b.queue <- struct{}{} // wake the worker
+	return id, nil
+}
+
+// EnqueueCommand adds a command to the persistent queue and returns its job ID.
+func (b *Bridge) EnqueueCommand(cmd string, args []string) (int64, error) {
+	argsJSON, _ := json.Marshal(args)
+	id, err := b.store.Enqueue("command", cmd, string(argsJSON))
+	if err != nil {
+		return 0, err
+	}
+	b.queue <- struct{}{} // wake the worker
+	return id, nil
+}
+
+// QueueDepth returns the number of pending jobs.
+func (b *Bridge) QueueDepth() int {
+	count, _ := b.store.PendingCount()
+	return count
+}
+
+// worker processes jobs sequentially from the persistent queue.
 func (b *Bridge) worker() {
-	for j := range b.queue {
-		if j.command != "" {
-			result := b.handleCommand(j.command, j.args)
-			fmt.Fprint(j.out, result)
-			j.done <- nil
-		} else {
-			err := b.send(j.prompt, j.out)
-			j.done <- err
+	for range b.queue {
+		j, err := b.store.NextPending()
+		if err != nil {
+			log.Printf("bridge: worker error fetching job: %v", err)
+			continue
+		}
+		if j == nil {
+			continue // spurious wake
+		}
+
+		log.Printf("bridge: processing job #%d type=%s", j.ID, j.Type)
+
+		switch j.Type {
+		case "prompt":
+			if err := b.processPrompt(j); err != nil {
+				log.Printf("bridge: job #%d failed: %v", j.ID, err)
+				b.store.Fail(j.ID, err.Error())
+			} else {
+				b.store.Complete(j.ID)
+			}
+		case "command":
+			b.processCommand(j)
+			b.store.Complete(j.ID)
 		}
 	}
 }
 
-// Send queues a prompt and blocks until the agent has finished responding.
-func (b *Bridge) Send(prompt string, out io.Writer) error {
-	done := make(chan error, 1)
-	b.queue <- job{prompt: prompt, out: out, done: done}
-	return <-done
-}
-
-// HandleCommand queues a command and blocks until it's processed.
-func (b *Bridge) HandleCommand(cmd string, args []string, out io.Writer) error {
-	done := make(chan error, 1)
-	b.queue <- job{command: cmd, args: args, out: out, done: done}
-	return <-done
-}
-
-// QueueDepth returns the number of pending jobs in the queue.
-func (b *Bridge) QueueDepth() int {
-	return len(b.queue)
-}
-
-func (b *Bridge) spawnPersistent() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	cmd := exec.Command(b.cfg.Command, b.cfg.Args...)
-	cmd.Dir = b.cfg.Workdir
-	cmd.Env = buildEnv(b.cfg.Env)
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start agent: %w", err)
-	}
-
-	b.cmd = cmd
-	b.stdin = stdin
-	b.stdout = stdout
-
-	log.Printf("bridge: started persistent agent %q (pid %d)", b.cfg.Command, cmd.Process.Pid)
-	return nil
-}
-
-// send dispatches to the appropriate mode. Called only from the worker goroutine.
-func (b *Bridge) send(prompt string, out io.Writer) error {
-	if b.cfg.InputMode == "flag" {
-		return b.sendFlag(prompt, out)
-	}
-	return b.sendStdin(prompt, out)
-}
-
-func (b *Bridge) sendFlag(prompt string, out io.Writer) error {
+// processPrompt runs the agent CLI with session continuation.
+func (b *Bridge) processPrompt(j *StoredJob) error {
 	args := make([]string, len(b.cfg.Args))
 	copy(args, b.cfg.Args)
 
-	// Add session ID if configured.
+	// Add session ID.
 	if b.cfg.SessionFlag != "" && b.sessionID != "" {
 		args = append(args, b.cfg.SessionFlag, b.sessionID)
 	}
 
-	// Add resume flag on subsequent prompts (session already exists).
-	if b.prompted && b.cfg.ResumeFlag != "" {
+	// Resume on subsequent prompts.
+	b.mu.Lock()
+	shouldResume := b.prompted
+	b.mu.Unlock()
+
+	if shouldResume && b.cfg.ResumeFlag != "" {
 		args = append(args, b.cfg.ResumeFlag)
 	}
 
+	// Add the prompt.
 	if b.cfg.InputFlag != "" {
-		args = append(args, b.cfg.InputFlag, prompt)
+		args = append(args, b.cfg.InputFlag, j.Payload)
 	} else {
-		args = append(args, prompt)
+		args = append(args, j.Payload)
 	}
 
 	cmd := exec.Command(b.cfg.Command, args...)
@@ -163,50 +159,37 @@ func (b *Bridge) sendFlag(prompt string, out io.Writer) error {
 		return fmt.Errorf("start agent: %w", err)
 	}
 
-	log.Printf("bridge: spawned %q session=%q resume=%v prompt=(%d chars)",
-		b.cfg.Command, b.sessionID, b.prompted, len(prompt))
+	log.Printf("bridge: spawned %q session=%q resume=%v job=#%d",
+		b.cfg.Command, b.sessionID, shouldResume, j.ID)
 
-	// Stream output line by line.
+	// Stream output and persist it.
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Fprintln(out, line)
+		line := scanner.Text() + "\n"
+		b.store.AppendResponse(j.ID, line)
+		// Notify connected clients via the output broadcast (added later).
 	}
 
+	b.mu.Lock()
 	b.prompted = true
+	b.mu.Unlock()
+
 	return cmd.Wait()
 }
 
-func (b *Bridge) sendStdin(prompt string, out io.Writer) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.stdin == nil {
-		return fmt.Errorf("agent process not running")
+// processCommand handles a slash command.
+func (b *Bridge) processCommand(j *StoredJob) {
+	var args []string
+	if j.Args != "" {
+		json.Unmarshal([]byte(j.Args), &args)
 	}
 
-	// Write the prompt followed by a newline.
-	if _, err := fmt.Fprintln(b.stdin, prompt); err != nil {
-		return fmt.Errorf("write to agent: %w", err)
-	}
-
-	// Read response lines until we get an empty line or EOF.
-	scanner := bufio.NewScanner(b.stdout)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Fprintln(out, line)
-		// Empty line signals end of response for interactive mode.
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-	}
-
-	return scanner.Err()
+	result := b.handleCommand(j.Payload, args)
+	b.store.AppendResponse(j.ID, result)
 }
 
-// handleCommand processes a slash command. Called only from the worker goroutine.
+// handleCommand dispatches slash commands.
 func (b *Bridge) handleCommand(cmd string, args []string) string {
 	switch cmd {
 	case "/reset":
@@ -226,50 +209,21 @@ func (b *Bridge) cmdReset(args []string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	switch b.cfg.InputMode {
-	case "flag":
-		// Flag mode: generate a new session ID so next prompt starts fresh.
-		id := ""
-		if len(args) > 0 {
-			id = args[0]
-		}
-		if id == "" {
-			id = fmt.Sprintf("ab-%d-%d", os.Getpid(), time.Now().Unix())
-		}
-		b.sessionID = id
-		b.prompted = false
-		return fmt.Sprintf("OK session=%s\n", id)
-
-	case "stdin":
-		// Stdin mode: kill the persistent process and respawn it.
-		if b.cmd != nil && b.cmd.Process != nil {
-			b.stdin.Close()
-			b.cmd.Process.Kill()
-			b.cmd.Wait()
-			b.cmd = nil
-		}
-		b.prompted = false
-		// Respawn without holding the lock (unlock, spawn, relock).
-		b.mu.Unlock()
-		err := b.spawnPersistent()
-		b.mu.Lock()
-		if err != nil {
-			return fmt.Sprintf("ERROR: respawn failed: %v\n", err)
-		}
-		return "OK process restarted\n"
-
-	default:
-		return "ERROR: unknown input mode\n"
+	id := ""
+	if len(args) > 0 {
+		id = args[0]
 	}
+	if id == "" {
+		id = fmt.Sprintf("ab-%d-%d", os.Getpid(), time.Now().Unix())
+	}
+	b.sessionID = id
+	b.prompted = false
+	return fmt.Sprintf("OK session=%s\n", id)
 }
 
 func (b *Bridge) cmdSession(args []string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if b.cfg.InputMode != "flag" {
-		return fmt.Sprintf("OK mode=%s (session IDs only apply to flag mode)\n", b.cfg.InputMode)
-	}
 
 	if len(args) == 0 {
 		return fmt.Sprintf("OK session=%s\n", b.sessionID)
@@ -285,46 +239,22 @@ func (b *Bridge) cmdStatus() string {
 	defer b.mu.Unlock()
 
 	queued := b.QueueDepth()
-
-	switch b.cfg.InputMode {
-	case "flag":
-		return fmt.Sprintf("OK mode=flag agent=%s session=%s prompted=%v queued=%d\n",
-			b.cfg.Command, b.sessionID, b.prompted, queued)
-	case "stdin":
-		pid := 0
-		if b.cmd != nil && b.cmd.Process != nil {
-			pid = b.cmd.Process.Pid
-		}
-		return fmt.Sprintf("OK mode=stdin agent=%s pid=%d prompted=%v queued=%d\n",
-			b.cfg.Command, pid, b.prompted, queued)
-	default:
-		return fmt.Sprintf("OK mode=%s agent=%s queued=%d\n", b.cfg.InputMode, b.cfg.Command, queued)
-	}
+	return fmt.Sprintf("OK agent=%s session=%s prompted=%v queued=%d\n",
+		b.cfg.Command, b.sessionID, b.prompted, queued)
 }
 
 func (b *Bridge) cmdHelp() string {
-	help := "/reset          — reset agent context (new session or restart process)\n"
-	help += "/session        — show current session ID (flag mode only)\n"
-	help += "/session <id>   — switch to a specific session ID (flag mode only)\n"
-	help += "/status         — show bridge status (mode, agent, session/pid, queue depth)\n"
+	help := "/reset          — reset session (new ID, fresh context)\n"
+	help += "/session        — show current session ID\n"
+	help += "/session <id>   — switch to a specific session ID\n"
+	help += "/status         — show bridge status\n"
 	help += "/help           — show this help\n"
 	return help
 }
 
-// Stop terminates the agent process if running.
+// Stop closes the queue channel. Pending jobs persist in SQLite for next startup.
 func (b *Bridge) Stop() {
-	close(b.queue) // stop the worker
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if b.cmd != nil && b.cmd.Process != nil {
-		log.Printf("bridge: stopping agent (pid %d)", b.cmd.Process.Pid)
-		b.stdin.Close()
-		b.cmd.Process.Kill()
-		b.cmd.Wait()
-		b.cmd = nil
-	}
+	close(b.queue)
 }
 
 // buildEnv merges the current environment with agent-specific overrides.
@@ -335,3 +265,18 @@ func buildEnv(overrides map[string]string) []string {
 	}
 	return env
 }
+
+// responseWriter wraps a store to implement io.Writer, persisting all output.
+type responseWriter struct {
+	store *Store
+	jobID int64
+}
+
+func (rw *responseWriter) Write(p []byte) (int, error) {
+	if err := rw.store.AppendResponse(rw.jobID, string(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+var _ io.Writer = (*responseWriter)(nil)
