@@ -1,26 +1,21 @@
 // agent-bridge — TCP-to-CLI bridge for AI coding assistants.
 //
 // Exposes AI coding assistants (Claude Code, Codex, OpenCode) as
-// network-accessible services. All prompts use session IDs for
-// conversation continuity. Jobs are persisted in SQLite so nothing
-// is lost on crash/restart.
+// network-accessible services using a binary framed protocol. All
+// prompts use session IDs for conversation continuity. Jobs are
+// persisted in SQLite so nothing is lost on crash/restart.
+//
+// Wire protocol: [4 bytes: length][1 byte: type][N bytes: payload]
 //
 // Usage:
 //
-//	agent-bridge --listen :9999 --config agent.yaml --session ws-abc123
-//
-// Flags:
-//
-//	--listen   Address to listen on (default ":9999")
-//	--config   Path to agent config YAML (default "agent.yaml")
-//	--session  Session ID for conversation continuity
-//	--db       Path to SQLite database (default "agent-bridge.db")
-//	--version  Print version and exit
+//	agent-bridge --listen :9999 --agent claude --session ws-abc123
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -37,7 +32,7 @@ var version = "dev"
 
 func main() {
 	listen := flag.String("listen", ":9999", "Address to listen on")
-	configPath := flag.String("config", "agent.yaml", "Path to agent config YAML")
+	agentName := flag.String("agent", "claude", "Agent to use (claude, codex, opencode)")
 	sessionID := flag.String("session", "", "Session ID for conversation continuity (default: auto-generated)")
 	dbPath := flag.String("db", "agent-bridge.db", "Path to SQLite database")
 	showVersion := flag.Bool("version", false, "Print version and exit")
@@ -49,7 +44,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	cfg, err := LoadConfig(*configPath)
+	cfg, err := LoadBuiltinConfig(*agentName)
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
@@ -57,7 +52,6 @@ func main() {
 	agent := cfg.ActiveAgent()
 	log.Printf("agent-bridge: active agent=%q command=%q", cfg.Active, agent.Command)
 
-	// Default session ID if not provided.
 	sid := *sessionID
 	if sid == "" {
 		sid = fmt.Sprintf("ab-%d", os.Getpid())
@@ -86,7 +80,6 @@ func main() {
 
 	log.Printf("agent-bridge listening on %s (session=%s, db=%s)", *listen, sid, *dbPath)
 
-	// Accept connections in a loop.
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -107,39 +100,57 @@ func main() {
 	log.Println("agent-bridge: shutting down")
 }
 
-// connWriter is a thread-safe writer for a TCP connection.
-type connWriter struct {
+// protoWriter sends binary-framed messages to a TCP connection (thread-safe).
+type protoWriter struct {
 	mu   sync.Mutex
 	conn net.Conn
 }
 
-func (cw *connWriter) Write(p []byte) (int, error) {
-	cw.mu.Lock()
-	defer cw.mu.Unlock()
-	return cw.conn.Write(p)
+func (pw *protoWriter) send(msgType byte, payload []byte) error {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	return WriteMessage(pw.conn, Message{Type: msgType, Payload: payload})
 }
 
-func (cw *connWriter) writeLine(s string) {
-	cw.mu.Lock()
-	defer cw.mu.Unlock()
-	fmt.Fprintln(cw.conn, s)
+func (pw *protoWriter) sendJSON(msgType byte, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	return pw.send(msgType, data)
 }
 
-// handleConn manages a TCP connection with async input/output.
-// Inbound messages are queued immediately with a QUEUED acknowledgement.
-// A per-connection goroutine polls for completed jobs and streams results back.
+// queuedAck is the QUEUED acknowledgement payload.
+type queuedAck struct {
+	ID       int64 `json:"id"`
+	Position int   `json:"pos"`
+}
+
+// responseEnd is the end-of-response payload.
+type responseEnd struct {
+	ID int64 `json:"id"`
+}
+
+// errorPayload is the error message payload.
+type errorPayload struct {
+	ID      int64  `json:"id,omitempty"`
+	Message string `json:"message"`
+}
+
+// handleConn manages a TCP connection using the binary framed protocol.
 func handleConn(conn net.Conn, bridge *Bridge) {
 	defer conn.Close()
 	remote := conn.RemoteAddr().String()
 	log.Printf("connection from %s", remote)
 
-	cw := &connWriter{conn: conn}
+	pw := &protoWriter{conn: conn}
+	reader := bufio.NewReader(conn)
 
-	// Track job IDs submitted by this connection for response streaming.
+	// Track pending jobs for this connection.
 	var pendingMu sync.Mutex
 	pendingJobs := make([]int64, 0)
 
-	// Response streamer — polls for completed jobs and sends results back.
+	// Response streamer — polls for completed jobs and sends results.
 	stopStreamer := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
@@ -164,13 +175,15 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 				}
 
 				if job.Status == StatusDone || job.Status == StatusError {
+					// Send response content.
 					if job.Response != "" {
-						cw.Write([]byte(job.Response))
+						pw.send(MsgResponseLine, []byte(job.Response))
 					}
 					if job.Status == StatusError && job.Error != "" {
-						cw.writeLine(fmt.Sprintf("ERROR: %s", job.Error))
+						pw.sendJSON(MsgError, errorPayload{ID: jobID, Message: job.Error})
 					}
-					cw.writeLine("---END---")
+					// Signal response complete.
+					pw.sendJSON(MsgResponseEnd, responseEnd{ID: jobID})
 
 					pendingMu.Lock()
 					pendingJobs = pendingJobs[1:]
@@ -180,30 +193,42 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 		}
 	}()
 
-	scanner := bufio.NewScanner(conn)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
+	// Read binary-framed messages.
+	for {
+		msg, err := ReadMessage(reader)
+		if err != nil {
+			if err.Error() != "read length: EOF" {
+				log.Printf("[%s] read error: %v", remote, err)
+			}
+			break
 		}
 
 		var jobID int64
-		var err error
 
-		if strings.HasPrefix(line, "/") {
-			parts := strings.Fields(line)
-			log.Printf("[%s] command: %s", remote, line)
+		switch msg.Type {
+		case MsgPrompt:
+			prompt := string(msg.Payload)
+			log.Printf("[%s] prompt: %s", remote, truncate(prompt, 80))
+			jobID, err = bridge.Enqueue(prompt)
+
+		case MsgCommand:
+			cmdLine := string(msg.Payload)
+			parts := strings.Fields(cmdLine)
+			if len(parts) == 0 {
+				continue
+			}
+			log.Printf("[%s] command: %s", remote, cmdLine)
 			jobID, err = bridge.EnqueueCommand(parts[0], parts[1:])
-		} else {
-			log.Printf("[%s] prompt: %s", remote, truncate(line, 80))
-			jobID, err = bridge.Enqueue(line)
+
+		default:
+			log.Printf("[%s] unknown message type: 0x%02x", remote, msg.Type)
+			pw.sendJSON(MsgError, errorPayload{Message: fmt.Sprintf("unknown message type: 0x%02x", msg.Type)})
+			continue
 		}
 
 		if err != nil {
 			log.Printf("[%s] enqueue error: %v", remote, err)
-			cw.writeLine(fmt.Sprintf("ERROR: %v", err))
+			pw.sendJSON(MsgError, errorPayload{Message: err.Error()})
 			continue
 		}
 
@@ -211,14 +236,10 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 		pendingJobs = append(pendingJobs, jobID)
 		pendingMu.Unlock()
 
-		cw.writeLine(fmt.Sprintf("QUEUED id=%d pos=%d", jobID, bridge.QueueDepth()))
+		pw.sendJSON(MsgQueued, queuedAck{ID: jobID, Position: bridge.QueueDepth()})
 	}
 
 	close(stopStreamer)
-
-	if err := scanner.Err(); err != nil {
-		log.Printf("[%s] read error: %v", remote, err)
-	}
 	log.Printf("[%s] disconnected", remote)
 }
 

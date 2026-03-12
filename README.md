@@ -15,15 +15,14 @@ go install github.com/antimatter-studios/agentbridge@latest
 ## Usage
 
 ```bash
-# Start with default config (Claude Code on :9999)
-agent-bridge --listen :9999 --config agent.yaml
+# Start with Claude Code (default) on :9999
+agent-bridge --listen :9999 --agent claude --session ws-abc123
 
-# Connect and send a prompt
-echo "list the files in the current directory" | nc localhost 9999
+# Use Codex instead
+agent-bridge --agent codex --session ws-abc123
 
-# Or interactively
-nc localhost 9999
-> create a hello world web server in Go
+# With SQLite persistence
+agent-bridge --agent claude --session ws-abc123 --db /workspace/.agent-bridge.db
 ```
 
 ## Flags
@@ -31,54 +30,40 @@ nc localhost 9999
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--listen` | `:9999` | Address to listen on |
-| `--config` | `agent.yaml` | Path to agent config YAML |
+| `--agent` | `claude` | Agent to use (claude, codex, opencode) |
+| `--session` | auto | Session ID for conversation continuity |
+| `--db` | `agent-bridge.db` | Path to SQLite database for job persistence |
 | `--version` | | Print version and exit |
 
-## Configuration
+## Built-in Agents
 
-`agent.yaml` defines how to spawn and communicate with each CLI agent:
+Agent configs are baked into the binary — no external YAML needed:
 
-```yaml
-active: claude
-
-agents:
-  claude:
-    command: claude
-    args: ["--print", "--output-format", "stream-json", "--model", "claude-sonnet-4-6"]
-    input_mode: flag      # spawns a new process per prompt
-    input_flag: "-p"      # flag that precedes the prompt text
-    workdir: /workspace
-    env:
-      CI: "1"
-
-  codex:
-    command: codex
-    args: ["--quiet"]
-    input_mode: stdin     # persistent process, prompts written to stdin
-    workdir: /workspace
-```
-
-### Input modes
-
-- **flag** — spawns a new CLI process per prompt, appending the prompt as a CLI argument (e.g. `claude -p "prompt"`). Best for tools with a one-shot mode.
-- **stdin** — maintains a persistent CLI process and writes prompts to stdin. Best for interactive/REPL-style tools.
+- **claude** — Claude Code with session continuity (`--session-id`, `--resume`)
+- **codex** — OpenAI Codex CLI
+- **opencode** — OpenCode CLI
 
 ## Protocol
 
-The TCP protocol is newline-delimited text:
+Binary framed protocol: `[4 bytes: length][1 byte: type][N bytes: payload]`
 
-1. Client sends a prompt (single line, newline-terminated)
-2. Server streams the agent's response line by line
-3. Server sends `---END---` to signal response complete
-4. Client can send another prompt or disconnect
+**Client → Server:**
+- `0x01` Prompt — send a prompt to the agent
+- `0x02` Command — send a slash command (e.g. `/reset`)
+
+**Server → Client:**
+- `0x10` Queued — job queued ack (JSON: `{id, pos}`)
+- `0x11` ResponseLine — a chunk of agent response
+- `0x12` ResponseEnd — response complete (JSON: `{id}`)
+- `0x13` Error — error message (JSON: `{id, message}`)
 
 ## How it works
 
-1. Reads `agent.yaml` to determine which CLI agent to use
-2. Listens on a TCP port
-3. For each connection, reads newline-delimited prompts
-4. Spawns (flag mode) or writes to (stdin mode) the CLI agent
-5. Streams the agent's stdout back over the TCP connection
+1. Selects built-in agent config by name
+2. Listens on TCP port with binary framed protocol
+3. Queues incoming prompts in SQLite (survives crashes)
+4. Worker processes jobs sequentially, spawning CLI with session flags
+5. Response streamer polls completed jobs and sends results back
 6. portpilot detects the listening port and auto-forwards it
 
 ## Docker

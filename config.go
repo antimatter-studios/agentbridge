@@ -1,51 +1,71 @@
 package main
 
-import (
-	"fmt"
-	"os"
-
-	"gopkg.in/yaml.v3"
-)
-
-// Config is the top-level agent-bridge configuration.
-type Config struct {
-	Active string                 `yaml:"active"`
-	Agents map[string]AgentConfig `yaml:"agents"`
-}
+import "fmt"
 
 // AgentConfig defines how to spawn and communicate with a single CLI agent.
 // All agents use session-based conversation — each prompt spawns a CLI
 // invocation with session continuation flags.
 type AgentConfig struct {
-	Command     string            `yaml:"command"`
-	Args        []string          `yaml:"args"`
-	InputFlag   string            `yaml:"input_flag"`   // flag that precedes the prompt (e.g. "-p")
-	SessionFlag string            `yaml:"session_flag"` // flag for session ID (e.g. "--session-id")
-	ResumeFlag  string            `yaml:"resume_flag"`  // flag to resume a session (e.g. "--resume")
-	Workdir     string            `yaml:"workdir"`
-	Env         map[string]string `yaml:"env"`
+	Command     string
+	Args        []string
+	InputFlag   string // flag that precedes the prompt (e.g. "-p")
+	SessionFlag string // flag for session ID (e.g. "--session-id")
+	ResumeFlag  string // flag to resume a session (e.g. "--resume")
+	Workdir     string
+	Env         map[string]string
 }
 
-// LoadConfig reads and parses the YAML config file.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
+// Config is the top-level agent-bridge configuration.
+type Config struct {
+	Active string
+	Agents map[string]AgentConfig
+}
+
+// builtinAgents are the known agent configurations baked into the binary.
+var builtinAgents = map[string]AgentConfig{
+	"claude": {
+		Command: "claude",
+		Args: []string{
+			"--print",
+			"--output-format", "stream-json",
+			"--model", "claude-sonnet-4-6",
+		},
+		InputFlag:   "-p",
+		SessionFlag: "--session-id",
+		ResumeFlag:  "--resume",
+		Workdir:     "/workspace",
+		Env:         map[string]string{"CI": "1"},
+	},
+	"codex": {
+		Command:   "codex",
+		Args:      []string{"--quiet"},
+		InputFlag: "",
+		Workdir:   "/workspace",
+		Env:       map[string]string{},
+	},
+	"opencode": {
+		Command:   "opencode",
+		Args:      []string{},
+		InputFlag: "",
+		Workdir:   "/workspace",
+		Env:       map[string]string{},
+	},
+}
+
+// LoadBuiltinConfig returns a Config with baked-in agents, selecting the given one as active.
+func LoadBuiltinConfig(active string) (*Config, error) {
+	if _, ok := builtinAgents[active]; !ok {
+		known := make([]string, 0, len(builtinAgents))
+		for k := range builtinAgents {
+			known = append(known, k)
+		}
+		return nil, fmt.Errorf("unknown agent %q (known: %v)", active, known)
 	}
 
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
-	}
-
-	if cfg.Active == "" {
-		return nil, fmt.Errorf("config: 'active' agent not specified")
-	}
-	if _, ok := cfg.Agents[cfg.Active]; !ok {
-		return nil, fmt.Errorf("config: active agent %q not found in agents", cfg.Active)
-	}
-
-	return &cfg, nil
+	return &Config{
+		Active: active,
+		Agents: builtinAgents,
+	}, nil
 }
 
 // ActiveAgent returns the configuration for the currently active agent.
