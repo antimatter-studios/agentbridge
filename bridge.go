@@ -159,31 +159,108 @@ func (b *Bridge) sendStdin(prompt string, out io.Writer) error {
 	return scanner.Err()
 }
 
-// SessionID returns the current session ID.
-func (b *Bridge) SessionID() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.sessionID
-}
-
-// HasPrompted returns whether at least one prompt has been sent.
-func (b *Bridge) HasPrompted() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.prompted
-}
-
-// ResetSession switches to a new session ID. If id is empty, generates one.
-// Returns the new session ID.
-func (b *Bridge) ResetSession(id string) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if id == "" {
-		id = fmt.Sprintf("ab-%d-%d", os.Getpid(), time.Now().Unix())
+// HandleCommand processes a slash command and returns the response text.
+// Commands are agent-aware — behavior varies by input mode and agent type.
+func (b *Bridge) HandleCommand(cmd string, args []string) string {
+	switch cmd {
+	case "/reset":
+		return b.cmdReset(args)
+	case "/session":
+		return b.cmdSession(args)
+	case "/status":
+		return b.cmdStatus()
+	case "/help":
+		return b.cmdHelp()
+	default:
+		return fmt.Sprintf("ERROR: unknown command %q (try /help)\n", cmd)
 	}
-	b.sessionID = id
+}
+
+func (b *Bridge) cmdReset(args []string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	switch b.cfg.InputMode {
+	case "flag":
+		// Flag mode: generate a new session ID so next prompt starts fresh.
+		id := ""
+		if len(args) > 0 {
+			id = args[0]
+		}
+		if id == "" {
+			id = fmt.Sprintf("ab-%d-%d", os.Getpid(), time.Now().Unix())
+		}
+		b.sessionID = id
+		b.prompted = false
+		return fmt.Sprintf("OK session=%s\n", id)
+
+	case "stdin":
+		// Stdin mode: kill the persistent process and respawn it.
+		if b.cmd != nil && b.cmd.Process != nil {
+			b.stdin.Close()
+			b.cmd.Process.Kill()
+			b.cmd.Wait()
+			b.cmd = nil
+		}
+		b.prompted = false
+		// Respawn without holding the lock (unlock, spawn, relock).
+		b.mu.Unlock()
+		err := b.spawnPersistent()
+		b.mu.Lock()
+		if err != nil {
+			return fmt.Sprintf("ERROR: respawn failed: %v\n", err)
+		}
+		return "OK process restarted\n"
+
+	default:
+		return "ERROR: unknown input mode\n"
+	}
+}
+
+func (b *Bridge) cmdSession(args []string) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.cfg.InputMode != "flag" {
+		return fmt.Sprintf("OK mode=%s (session IDs only apply to flag mode)\n", b.cfg.InputMode)
+	}
+
+	if len(args) == 0 {
+		return fmt.Sprintf("OK session=%s\n", b.sessionID)
+	}
+
+	b.sessionID = args[0]
 	b.prompted = false
-	return id
+	return fmt.Sprintf("OK session=%s\n", b.sessionID)
+}
+
+func (b *Bridge) cmdStatus() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	switch b.cfg.InputMode {
+	case "flag":
+		return fmt.Sprintf("OK mode=flag agent=%s session=%s prompted=%v\n",
+			b.cfg.Command, b.sessionID, b.prompted)
+	case "stdin":
+		pid := 0
+		if b.cmd != nil && b.cmd.Process != nil {
+			pid = b.cmd.Process.Pid
+		}
+		return fmt.Sprintf("OK mode=stdin agent=%s pid=%d prompted=%v\n",
+			b.cfg.Command, pid, b.prompted)
+	default:
+		return fmt.Sprintf("OK mode=%s agent=%s\n", b.cfg.InputMode, b.cfg.Command)
+	}
+}
+
+func (b *Bridge) cmdHelp() string {
+	help := "/reset          — reset agent context (new session or restart process)\n"
+	help += "/session        — show current session ID (flag mode only)\n"
+	help += "/session <id>   — switch to a specific session ID (flag mode only)\n"
+	help += "/status         — show bridge status (mode, agent, session/pid)\n"
+	help += "/help           — show this help\n"
+	return help
 }
 
 // Stop terminates the agent process if running.

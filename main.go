@@ -135,40 +135,14 @@ func handleConn(conn net.Conn, bridge *Bridge) {
 	log.Printf("[%s] disconnected", remote)
 }
 
-// handleCommand processes slash commands sent over the TCP connection.
+// handleCommand delegates slash commands to the bridge, which knows
+// what agent it's talking to and how to handle each command.
 func handleCommand(conn net.Conn, bridge *Bridge, remote, line string) {
 	parts := strings.Fields(line)
-	cmd := parts[0]
+	log.Printf("[%s] command: %s", remote, line)
 
-	switch cmd {
-	case "/reset":
-		newID := bridge.ResetSession("")
-		log.Printf("[%s] session reset → %s", remote, newID)
-		fmt.Fprintf(conn, "OK session=%s\n", newID)
-
-	case "/session":
-		if len(parts) < 2 {
-			fmt.Fprintf(conn, "OK session=%s\n", bridge.SessionID())
-			return
-		}
-		newID := bridge.ResetSession(parts[1])
-		log.Printf("[%s] session set → %s", remote, newID)
-		fmt.Fprintf(conn, "OK session=%s\n", newID)
-
-	case "/status":
-		fmt.Fprintf(conn, "OK session=%s prompted=%v\n", bridge.SessionID(), bridge.HasPrompted())
-
-	case "/help":
-		fmt.Fprintln(conn, "/reset          — start a new session (generates fresh ID)")
-		fmt.Fprintln(conn, "/session        — show current session ID")
-		fmt.Fprintln(conn, "/session <id>   — switch to a specific session ID")
-		fmt.Fprintln(conn, "/status         — show bridge status")
-		fmt.Fprintln(conn, "/help           — show this help")
-
-	default:
-		fmt.Fprintf(conn, "ERROR: unknown command %q (try /help)\n", cmd)
-	}
-
+	result := bridge.HandleCommand(parts[0], parts[1:])
+	fmt.Fprint(conn, result)
 	fmt.Fprintln(conn, "---END---")
 }
 
