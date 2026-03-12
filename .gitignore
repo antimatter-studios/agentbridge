@@ -1,0 +1,12 @@
+# Build artifacts
+agentbridge
+**/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
