@@ -34,6 +34,7 @@ var version = "dev"
 func main() {
 	listen := flag.String("listen", ":9999", "Address to listen on")
 	configPath := flag.String("config", "agent.yaml", "Path to agent config YAML")
+	sessionID := flag.String("session", "", "Session ID for conversation continuity (default: auto-generated)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 
 	flag.Parse()
@@ -51,7 +52,13 @@ func main() {
 	agent := cfg.ActiveAgent()
 	log.Printf("agent-bridge: active agent=%q command=%q input_mode=%q", cfg.Active, agent.Command, agent.InputMode)
 
-	bridge := NewBridge(agent)
+	// Default session ID if not provided.
+	sid := *sessionID
+	if sid == "" {
+		sid = fmt.Sprintf("ab-%d", os.Getpid())
+	}
+
+	bridge := NewBridge(agent, sid)
 	if err := bridge.Start(); err != nil {
 		log.Fatalf("bridge start: %v", err)
 	}

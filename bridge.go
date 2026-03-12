@@ -13,17 +13,19 @@ import (
 
 // Bridge manages a persistent CLI agent process and pipes messages to/from it.
 type Bridge struct {
-	cfg AgentConfig
+	cfg       AgentConfig
+	sessionID string
 
-	mu     sync.Mutex
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
+	mu        sync.Mutex
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	prompted  bool // true after the first prompt (for resume logic)
 }
 
-// NewBridge creates a bridge for the given agent config.
-func NewBridge(cfg AgentConfig) *Bridge {
-	return &Bridge{cfg: cfg}
+// NewBridge creates a bridge for the given agent config and session ID.
+func NewBridge(cfg AgentConfig, sessionID string) *Bridge {
+	return &Bridge{cfg: cfg, sessionID: sessionID}
 }
 
 // Start spawns the agent process in persistent/interactive mode.
@@ -83,6 +85,16 @@ func (b *Bridge) sendFlag(prompt string, out io.Writer) error {
 	args := make([]string, len(b.cfg.Args))
 	copy(args, b.cfg.Args)
 
+	// Add session ID if configured.
+	if b.cfg.SessionFlag != "" && b.sessionID != "" {
+		args = append(args, b.cfg.SessionFlag, b.sessionID)
+	}
+
+	// Add resume flag on subsequent prompts (session already exists).
+	if b.prompted && b.cfg.ResumeFlag != "" {
+		args = append(args, b.cfg.ResumeFlag)
+	}
+
 	if b.cfg.InputFlag != "" {
 		args = append(args, b.cfg.InputFlag, prompt)
 	} else {
@@ -103,7 +115,8 @@ func (b *Bridge) sendFlag(prompt string, out io.Writer) error {
 		return fmt.Errorf("start agent: %w", err)
 	}
 
-	log.Printf("bridge: spawned %q for prompt (%d chars)", b.cfg.Command, len(prompt))
+	log.Printf("bridge: spawned %q session=%q resume=%v prompt=(%d chars)",
+		b.cfg.Command, b.sessionID, b.prompted, len(prompt))
 
 	// Stream output line by line.
 	scanner := bufio.NewScanner(stdout)
@@ -113,6 +126,7 @@ func (b *Bridge) sendFlag(prompt string, out io.Writer) error {
 		fmt.Fprintln(out, line)
 	}
 
+	b.prompted = true
 	return cmd.Wait()
 }
 

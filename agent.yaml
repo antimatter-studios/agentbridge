@@ -17,6 +17,9 @@ agents:
     input_mode: flag
     # For flag mode, the flag that precedes the prompt text.
     input_flag: "-p"
+    # Session continuity — maintains conversation context across prompts.
+    session_flag: "--session-id"
+    resume_flag: "--resume"
     # Working directory for the agent process (default: current dir).
     workdir: /workspace
     # Environment variables to set for the agent process.

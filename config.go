@@ -15,12 +15,14 @@ type Config struct {
 
 // AgentConfig defines how to spawn and communicate with a single CLI agent.
 type AgentConfig struct {
-	Command   string            `yaml:"command"`
-	Args      []string          `yaml:"args"`
-	InputMode string            `yaml:"input_mode"` // "stdin" or "flag"
-	InputFlag string            `yaml:"input_flag"`  // used when input_mode is "flag"
-	Workdir   string            `yaml:"workdir"`
-	Env       map[string]string `yaml:"env"`
+	Command    string            `yaml:"command"`
+	Args       []string          `yaml:"args"`
+	InputMode  string            `yaml:"input_mode"`  // "stdin" or "flag"
+	InputFlag  string            `yaml:"input_flag"`   // used when input_mode is "flag"
+	SessionFlag string           `yaml:"session_flag"` // flag for session ID (e.g. "--session-id")
+	ResumeFlag string            `yaml:"resume_flag"`  // flag to resume a session (e.g. "--resume")
+	Workdir    string            `yaml:"workdir"`
+	Env        map[string]string `yaml:"env"`
 }
 
 // LoadConfig reads and parses the YAML config file.
